@@ -14,4 +14,16 @@
   <class type="rmcs_dart_guidance::manager::DartManager" base_class_type="rmcs_executor::Component">
     <description>Dart task manager: 4-shot group counting with lifting and limiting servo control.</description>
   </class>
+  <class type="rmcs_dart_guidance::v2::DartAgent" base_class_type="rmcs_executor::Component">
+    <description>New launcher (Board Lite) task agent: table-driven tasks for belt + carriage.</description>
+  </class>
+  <class type="rmcs_dart_guidance::v2::DartAgentTestDriver" base_class_type="rmcs_executor::Component">
+    <description>Bench-only command script driver for DartAgent. Do not use on the field.</description>
+  </class>
+  <class type="rmcs_dart_guidance::v2::DartAgentRemoteBridge" base_class_type="rmcs_executor::Component">
+    <description>DR16 switch-to-command bridge for the new launcher DartAgent.</description>
+  </class>
+  <class type="rmcs_dart_guidance::v2::DartStickSim" base_class_type="rmcs_executor::Component">
+    <description>Bench-only DR16 switch simulator. Do not use on the field.</description>
+  </class>
 </library>
