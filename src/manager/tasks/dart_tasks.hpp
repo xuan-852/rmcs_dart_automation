@@ -25,9 +25,10 @@ inline std::shared_ptr<manager::Task> make_init_task(TaskContext& ctx) {
     auto task = std::make_shared<TaskBuilder>("dart-init", "初始化", ctx);
 
     // 并行找机械零位
+    // 速度符号约定：正 = 向上。belt_home_velocity 配正数即向上顶。
     auto seek = std::make_shared<manager::ActionSet>("init_seek_zero");
     seek->also(std::make_shared<BeltStallAction>(
-        "belt_seek_top", ctx.belt, -ctx.settings.belt_home_velocity,
+        "belt_seek_top", ctx.belt, ctx.settings.belt_home_velocity,
         ctx.settings.homing_torque_limit, 500000));
     seek->also(std::make_shared<CarriageHomeAction>(
         "carriage_seek_switch", ctx.carriage, ctx.settings.carriage_home_velocity,

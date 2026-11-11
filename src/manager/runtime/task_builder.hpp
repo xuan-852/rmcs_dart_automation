@@ -53,10 +53,11 @@ public:
     }
 
     // ── 同步带归零：上推堵转 → 标零 ───────────────────────────────────────────
+    // 速度符号约定：正 = 向上，负 = 向下（与 belt_down 取负号保持一致）
     TaskBuilder& belt_home() {
         const auto& s = ctx_.settings;
         then(std::make_shared<BeltStallAction>(
-            "belt_home_up", ctx_.belt, -s.belt_home_velocity, s.homing_torque_limit,
+            "belt_home_up", ctx_.belt, s.belt_home_velocity, s.homing_torque_limit,
             kHomeTimeoutTicks));
         then(std::make_shared<BeltCalibrateAction>(
             "belt_home_zero", ctx_.belt, s.homing_torque_limit));

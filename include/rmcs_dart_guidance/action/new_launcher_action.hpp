@@ -47,6 +47,10 @@ public:
     }
 
     manager::ActionStatus update() override {
+        // 每 tick 重写目标（见 CarriageHomeAction 的说明）
+        belt_.set_torque_limit(torque_limit_);
+        belt_.set_velocity(velocity_);
+
         if (traveled() >= distance_)
             return manager::ActionStatus::SUCCESS;
         if (timeout_ticks_ > 0 && elapsed_ticks() >= timeout_ticks_)
@@ -92,6 +96,12 @@ public:
     }
 
     manager::ActionStatus update() override {
+        // 每 tick 重写目标，理由同 CarriageHomeAction::update()：
+        // 输出接口理论上保持值，但不能假设"没有人把它清掉"。
+        // 之前只在 on_enter 写一次，实测 carriage 因此完全不动。
+        belt_.set_torque_limit(torque_limit_);
+        belt_.set_velocity(velocity_);
+
         if (belt_.stalled(kStallVelocity, stall_torque_threshold())) {
             if (++stall_ticks_ >= kStallConfirmTicks)
                 return manager::ActionStatus::SUCCESS;
@@ -189,19 +199,35 @@ public:
             return fail(manager::ActionFailureReason::TIMEOUT);
         }
 
+        // 每 tick 重写速度目标。
+        // 之前只在 on_enter 写一次，实测弹舱完全不动：on_enter 由 tick_first()
+        // 调用一次，之后 tick() 只调 update()，目标一旦被清就再也写不回去。
+        // 重写成本极低，换来"目标一定在生效"的强保证。
         switch (phase_) {
         case 0:  // 找开关
+            carriage_.set_velocity(up_velocity_);
             if (carriage_.micro_switch()) {
                 hit_angle_ = carriage_.angle();
-                carriage_.set_velocity(back_off_velocity_);
                 phase_ = 1;
+                log("switch hit at angle=%.3f, back off to %.3f rad/s", hit_angle_, back_off_velocity_);
+            } else if (elapsed_ticks() % 1000 == 0) {
+                // 低速时进度慢，每秒报一次，现场一眼看出是"没转"还是"转得慢"
+                log("seeking: angle=%.3f vel=%.3f", carriage_.angle(), carriage_.velocity());
             }
             return manager::ActionStatus::RUNNING;
 
         default:  // 退离
+            carriage_.set_velocity(back_off_velocity_);
             if (std::abs(carriage_.angle() - hit_angle_) >= back_off_distance_) {
                 carriage_.hold();
+                log("backed off by %.3f, done", std::abs(carriage_.angle() - hit_angle_));
                 return manager::ActionStatus::SUCCESS;
+            }
+            if (elapsed_ticks() % 1000 == 0) {
+                log(
+                    "backing off: moved=%.4f/%.4f angle=%.3f",
+                    std::abs(carriage_.angle() - hit_angle_), back_off_distance_,
+                    carriage_.angle());
             }
             return manager::ActionStatus::RUNNING;
         }
@@ -210,6 +236,14 @@ public:
     void on_exit() override { carriage_.hold(); }
 
 private:
+    // 诊断日志：业务日志不受 should_log_lifecycle() 影响，现场调试需要有输出
+    template <typename... Args>
+    void log(const char* fmt, Args... args) {
+        if (runtime_context().logger != nullptr) {
+            RCLCPP_INFO(*runtime_context().logger, fmt, args...);
+        }
+    }
+
     NewCarriageResource& carriage_;
     double up_velocity_;
     double back_off_velocity_;
