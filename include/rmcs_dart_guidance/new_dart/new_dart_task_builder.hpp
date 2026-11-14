@@ -7,9 +7,9 @@
 
 #include <rmcs_dart_guidance/action/delay_action.hpp>
 #include <rmcs_dart_guidance/action/fire_count_increment_action.hpp>
-#include <rmcs_dart_guidance/action/new_launcher_action.hpp>
-#include <rmcs_dart_guidance/resource/new_launcher_resource.hpp>
-#include <rmcs_dart_guidance/settings/dart_settings.hpp>
+#include <rmcs_dart_guidance/new_dart/new_dart_actions.hpp>
+#include <rmcs_dart_guidance/new_dart/new_dart_io.hpp>
+#include <rmcs_dart_guidance/new_dart/new_dart_settings.hpp>
 
 #include <chrono>
 #include <memory>

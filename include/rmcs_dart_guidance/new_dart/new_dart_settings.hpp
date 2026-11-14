@@ -53,3 +53,61 @@ struct DartSettings {
 };
 
 } // namespace rmcs_dart_guidance::v2
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 参数表
+//
+// 系统里有哪些可调参数，看这一屏就够了。
+// 加参数：DartSettings 加字段 → 这张表加一行。load_settings 一行不用改。
+//
+// 带索引的停位参数（dart_0_carriage_staypoint ...）名字是动态生成的，
+// 进不了 constexpr 表，由 load_staypoints() 单独循环处理。
+// ═════════════════════════════════════════════════════════════════════════════
+
+
+namespace rmcs_dart_guidance::v2 {
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 参数表
+//
+// 系统里有哪些可调参数，看这一屏就够了。
+// 加参数：DartSettings 加字段 → 这张表加一行。load_settings 一行不用改。
+//
+// 带索引的停位参数（dart_0_carriage_staypoint ...）名字是动态生成的，
+// 进不了 constexpr 表，由 load_staypoints() 单独循环处理。
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct DoubleSetting {
+    const char* name;               // yaml 参数名
+    double DartSettings::*field;    // 对应字段
+};
+
+struct IntSetting {
+    const char* name;
+    int DartSettings::*field;
+};
+
+inline constexpr DoubleSetting kDoubleSettings[] = {
+    // ── 同步带 ──
+    {"belt_trigger_distance", &DartSettings::belt_trigger_distance},
+    {"belt_home_velocity", &DartSettings::belt_home_velocity},
+    {"belt_down_velocity", &DartSettings::belt_down_velocity},
+    {"belt_up_velocity", &DartSettings::belt_up_velocity},
+    {"homing_torque_limit", &DartSettings::homing_torque_limit},
+    {"belt_load_torque_limit", &DartSettings::belt_load_torque_limit},
+    {"belt_unload_torque_limit", &DartSettings::belt_unload_torque_limit},
+
+    // ── 弹舱 ──
+    {"carriage_home_velocity", &DartSettings::carriage_home_velocity},
+    {"carriage_back_off_velocity", &DartSettings::carriage_back_off_velocity},
+    {"carriage_back_off_distance", &DartSettings::carriage_back_off_distance},
+    {"carriage_goto_velocity", &DartSettings::carriage_goto_velocity},
+    {"carriage_goto_gain", &DartSettings::carriage_goto_gain},
+    {"carriage_goto_tolerance", &DartSettings::carriage_goto_tolerance},
+};
+
+inline constexpr IntSetting kIntSettings[] = {
+    {"dart_count", &DartSettings::dart_count},
+};
+
+} // namespace rmcs_dart_guidance::v2
