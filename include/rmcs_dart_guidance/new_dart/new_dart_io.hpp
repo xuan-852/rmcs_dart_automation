@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <string>
 
 #include <rclcpp/logging.hpp>
@@ -16,6 +17,11 @@ namespace rmcs_dart_guidance::v2 {
 //   上位机是决策者：本类直接写两台电机的目标（速度/力矩限幅/标零），
 //   并读回编码器与力矩自行判断堵转、到位、超时。
 //   下位机 BeltNewController 只做转发 + 左右同步，不含任何判断。
+//
+//   ⚠️ 本机构是「被弹簧顶住」的竖直滑台，不是靠重力自然下落：
+//      电机零电流（NaN）= 弹簧把滑块推回顶部 = 标定零点，
+//      这正是故障态想要的停位。所以 hold() 与 release() 语义必须分清，
+//      不要凭「重力会掉下来」的直觉把它们混用。
 // ─────────────────────────────────────────────────────────────────────────────
 class NewBeltResource {
 public:
@@ -83,10 +89,27 @@ public:
         *right_calibrate_ = on;
     }
 
-    // 停下：零速 + 力矩限幅保持（不用 NaN，竖直滑台会自由下滑）
+    // ── 停下：两种语义，别混用 ──────────────────────────────────────────────
+    //
+    //   hold()     零速 + 力矩限幅 → 速度环把滑块【刹在原地】。
+    //              动作正常结束必须用它：降到扳机位后要停在那儿等扳机升起，
+    //              放手就会被弹簧顶回顶部，整个供弹序列作废。
+    //
+    //   release()  速度写 NaN → PID 输出 NaN → 电调零电流 → 电机自由。
+    //              零电流 = 弹簧把滑块推回顶部 = 标定零点，
+    //              这是故障态（急停 / 任务失败）该有的停位。
+    //              注意这不是"掉下来"：机构没有重力自由下落，
+    //              刹车反而会把滑块卡在行程中间并离开零点。
     void hold(double torque_limit) {
         set_velocity(0.0);
         set_torque_limit(torque_limit);
+        calibrate(false);
+    }
+
+    void release() {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        set_velocity(nan);
+        set_torque_limit(nan);
         calibrate(false);
     }
 
@@ -172,6 +195,9 @@ public:
     void set_velocity(double velocity) { *cmd_velocity_ = velocity; }
     void calibrate(bool on) { *calibrate_ = on; }
 
+    // 弹舱是旋转货仓：没有重力，也没有弹簧顶住，位置由电机自己保持。
+    // 所以这里保持「零速」，让速度环把货仓刹在当前角度，
+    // 不要照抄同步带的 release()（放手只会让货仓在多发的停位之间飘）。
     void hold() {
         set_velocity(0.0);
         calibrate(false);

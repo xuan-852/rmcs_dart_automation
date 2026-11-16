@@ -176,8 +176,14 @@ private:
     void abort_all(const char* reason) {
         const std::size_t dropped = queue_.size();
 
-        // 停机构：零速 + 力矩保持（不用 NaN，竖直滑台会自由下滑）
-        belt_resource_.hold(settings_.homing_torque_limit);
+        // 同步带：故障态必须「放手」（NaN），不是「刹车」。
+        //   本机构被弹簧顶住，零电流 = 弹簧把滑块推回顶部 = 标定零点，
+        //   这是确定的已知位置；写零速反而会给反力矩把它卡在行程中间，
+        //   既离开零点又不知道停在哪。
+        //   注意这不是"掉下来"：没有重力自由下落这回事。
+        belt_resource_.release();
+
+        // 弹舱：旋转货仓，无重力无弹簧，必须保持角度（详见 NewCarriageResource::hold）
         carriage_resource_.hold();
 
         // 清队列

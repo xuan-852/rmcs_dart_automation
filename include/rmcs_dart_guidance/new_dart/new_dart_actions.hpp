@@ -17,7 +17,8 @@ namespace rmcs_dart_guidance::v2 {
 // 下位机不含任何判断，所以「走多远」「到没到」全部由这里的动作自己算：
 //   on_enter   记录起点角度，写目标速度
 //   update     读角度算已走距离，够数就成功，超时报失败
-//   on_exit    零速保持（不下电，竖直滑台会掉）
+//   on_exit    零速保持（刹住，不下电）—— 成功时机构必须停在当前位置
+//   on_failure 放手（NaN）—— 故障时让弹簧把滑块顶回零点，理由见 NewBeltResource::release()
 // ═════════════════════════════════════════════════════════════════════════════
 
 // ── 相对位移：从起点走够 distance ────────────────────────────────────────────
@@ -59,6 +60,11 @@ public:
     }
 
     void on_exit() override { belt_.hold(torque_limit_); }
+
+    // 失败时放手：弹簧把滑块顶回零点，停下位置确定可预期。
+    // 若沿用默认的 on_failure()（= on_exit 刹车），滑块会被卡在半路，
+    // 下次 dart-init 的「上推堵转找顶」起点就不可知了。
+    void on_failure() override { belt_.release(); }
 
 private:
     // 两侧取 max：只要有一侧走够就算到位，避免打滑侧拖累整体卡在超时
@@ -115,6 +121,9 @@ public:
 
     void on_exit() override { belt_.hold(torque_limit_); }
 
+    // 失败（含超时）时放手，同 BeltMoveAction：让弹簧把滑块顶回零点
+    void on_failure() override { belt_.release(); }
+
 private:
     // 堵转阈值随力矩限幅走：顶住了力矩一定会爬到限幅，
     // 用固定值会在限幅调小时永远判不出来。
@@ -154,6 +163,13 @@ public:
     void on_exit() override {
         belt_.calibrate(false);
         belt_.hold(torque_limit_);
+    }
+
+    // 标零本身不会动，失败通常意味着标零请求没被硬件层采到。
+    // 此时不要留在原地刹车：放手回顶，至少让下一次归零从确定位置开始。
+    void on_failure() override {
+        belt_.calibrate(false);
+        belt_.release();
     }
 
 private:
