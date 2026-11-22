@@ -15,7 +15,13 @@
     <description>Dart task manager: 4-shot group counting with lifting and limiting servo control.</description>
   </class>
   <class type="rmcs_dart_guidance::v2::DartAgent" base_class_type="rmcs_executor::Component">
-    <description>New launcher (Board Lite) task agent: table-driven tasks for belt + carriage.</description>
+    <description>New launcher task manager: queue, safety interlocks, and mission sequence.</description>
+  </class>
+  <class type="rmcs_dart_guidance::v2::BeltActionComponent" base_class_type="rmcs_executor::Component">
+    <description>New launcher belt action runner: executes generic belt actions with seq ack.</description>
+  </class>
+  <class type="rmcs_dart_guidance::v2::CarriageActionComponent" base_class_type="rmcs_executor::Component">
+    <description>New launcher carriage action runner: executes homing and goto actions with seq ack.</description>
   </class>
   <class type="rmcs_dart_guidance::v2::DartAgentTestDriver" base_class_type="rmcs_executor::Component">
     <description>Bench-only command script driver for DartAgent. Do not use on the field.</description>
