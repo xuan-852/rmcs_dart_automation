@@ -11,7 +11,6 @@
 #include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
 #include <rmcs_executor/component.hpp>
-#include <rmcs_msgs/switch.hpp>
 
 namespace rmcs_dart_guidance::v2 {
 
@@ -38,10 +37,9 @@ public:
               create_partner_component<CommandComponent>(get_component_name() + "_command"))
         , belt_(*this, *command_component_, "/dart/belt_action")
         , carriage_(*this, *command_component_, "/dart/carriage_action") {
+            
         // ── 1. 注册输入与状态输出 ───────────────────────────────────────────
         register_input("/dart/manager/command", command_input_, false);
-        register_input("/remote/switch/left", switch_left_, false);
-        register_input("/remote/switch/right", switch_right_, false);
 
         register_output("/dart/manager/fire_count", fire_count_output_, uint32_t{0});
         register_output("/dart/agent/current_task", current_task_output_, std::string{});
@@ -79,32 +77,9 @@ public:
             command_input_.make_and_bind_directly(std::string{});
             RCLCPP_WARN(logger_, "Failed to fetch \"/dart/manager/command\". Set to empty string.");
         }
-        if (!switch_left_.ready()) {
-            switch_left_.make_and_bind_directly(rmcs_msgs::Switch::UNKNOWN);
-            RCLCPP_WARN(logger_, "Failed to fetch \"/remote/switch/left\". E-STOP disabled.");
-        }
-        if (!switch_right_.ready()) {
-            switch_right_.make_and_bind_directly(rmcs_msgs::Switch::UNKNOWN);
-            RCLCPP_WARN(logger_, "Failed to fetch \"/remote/switch/right\". E-STOP disabled.");
-        }
     }
 
     void update() override {
-        const auto left = *switch_left_;
-        const auto right = *switch_right_;
-
-        if (left == rmcs_msgs::Switch::DOWN && right == rmcs_msgs::Switch::DOWN) {
-            if (runtime_state_.lifecycle_state != LifecycleState::ERROR)
-                stop_tasks(LifecycleState::ERROR, "E-STOP: both switches DOWN");
-            publish_state();
-            return;
-        }
-
-        if (left == rmcs_msgs::Switch::UP && right == rmcs_msgs::Switch::MIDDLE
-            && runtime_state_.lifecycle_state == LifecycleState::RUNNING) {
-            stop_tasks(LifecycleState::IDLE, "auto task aborted by manual switch");
-        }
-
         poll_commands();
 
         while (runtime_state_.lifecycle_state != LifecycleState::ERROR) {
@@ -156,6 +131,14 @@ private:
             RCLCPP_WARN(
                 logger_, "[DartAgent] ignored \"%s\" while state=ERROR (send recover first)",
                 command.c_str());
+            return;
+        }
+
+        if (command == "stop") {//此处将接入手动控制，映射在底层conntroller的manual_active_
+            if (runtime_state_.lifecycle_state == LifecycleState::RUNNING || !task_queue_.empty())
+                stop_tasks(LifecycleState::IDLE, "stopped");
+            else
+                safe_stop_all();
             return;
         }
 
@@ -279,8 +262,6 @@ private:
 
     // ── 输入接口 ────────────────────────────────────────────────────────────
     InputInterface<std::string> command_input_;
-    InputInterface<rmcs_msgs::Switch> switch_left_;
-    InputInterface<rmcs_msgs::Switch> switch_right_;
 
     // ── 输出接口 ────────────────────────────────────────────────────────────
     OutputInterface<uint32_t> fire_count_output_;

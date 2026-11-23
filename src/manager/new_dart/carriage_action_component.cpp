@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <utility>
 
 #include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
@@ -11,12 +12,8 @@ namespace rmcs_dart_guidance::v2 {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // CarriageActionComponent
-//   弹舱上层动作执行组件（标准 RMCS 写法）。
-//
-//   职责：
-//     接收 DartAgent 发来的通用能力指令（HOLD / HOME / GOTO / CALIBRATE），
-//     按 seq 订单号完成撞开关退离、角度定位与标零脉冲，底层 CarriageNewController
-//     仍保持纯执行器（手动覆盖 + 转发）。
+//   弹舱上层动作执行组件：接收 DartAgent 下发的 (seq, ActionType) 指令，
+//   完成保持、撞开关归零、软件标零与相对零点的 P 控定位。
 // ═════════════════════════════════════════════════════════════════════════════
 class CarriageActionComponent
     : public rmcs_executor::Component
@@ -31,24 +28,24 @@ public:
         : Node(
               get_component_name(),
               rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true)) {
-        // ── 1. 注册输入 ─────────────────────────────────────────────────────
+        // ── 1. 反馈输入 ─────────────────────────────────────────────────────
         register_input("/dart/carriage_action/command", command_input_, false);
         register_input("/dart/carriage_motor/angle", angle_, false);
         register_input("/dart/carriage_motor/velocity", velocity_, false);
         register_input("/dart/micro_switch", micro_switch_, false);
 
-        // ── 2. 注册输出 ─────────────────────────────────────────────────────
+        // ── 2. 底层控制输出 ─────────────────────────────────────────────────
         register_output("/dart/carriage_motor/cmd_velocity", cmd_velocity_, 0.0);
         register_output("/dart/carriage_motor/calibrate_request", calibrate_, false);
         register_output("/dart/carriage_action/feedback", feedback_output_, Feedback{});
 
         // ── 3. 读取参数 ─────────────────────────────────────────────────────
-        get_parameter_or("carriage_home_velocity", home_velocity_, 5.0);
-        get_parameter_or("carriage_back_off_velocity", back_off_velocity_, 2.0);
-        get_parameter_or("carriage_back_off_distance", back_off_distance_, 0.1);
-        get_parameter_or("carriage_goto_velocity", goto_velocity_, 20.0);
-        get_parameter_or("carriage_goto_gain", goto_gain_, 10.0);
-        get_parameter_or("carriage_goto_tolerance", goto_tolerance_, 0.02);
+        get_parameter_or("carriage_home_velocity", param_home_velocity_, 5.0);
+        get_parameter_or("carriage_back_off_velocity", param_back_off_velocity_, 2.0);
+        get_parameter_or("carriage_back_off_distance", param_back_off_distance_, 0.1);
+        get_parameter_or("carriage_goto_velocity", param_goto_velocity_, 20.0);
+        get_parameter_or("carriage_goto_gain", param_goto_gain_, 10.0);
+        get_parameter_or("carriage_goto_tolerance", param_goto_tolerance_, 0.02);
     }
 
     CarriageActionComponent(const CarriageActionComponent&) = delete;
@@ -59,167 +56,164 @@ public:
     ~CarriageActionComponent() override = default;
 
     void before_updating() override {
-        if (!command_input_.ready()) {
-            command_input_.make_and_bind_directly(ActionCmd{});
-            RCLCPP_WARN(
-                get_logger(), "Failed to fetch \"/dart/carriage_action/command\". Set to IDLE.");
-        }
-        if (!angle_.ready()) {
-            angle_.make_and_bind_directly(0.0);
-            RCLCPP_WARN(get_logger(), "Failed to fetch \"/dart/carriage_motor/angle\". Set to 0.");
-        }
-        if (!velocity_.ready()) {
-            velocity_.make_and_bind_directly(0.0);
-            RCLCPP_WARN(
-                get_logger(), "Failed to fetch \"/dart/carriage_motor/velocity\". Set to 0.");
-        }
-        if (!micro_switch_.ready()) {
-            micro_switch_.make_and_bind_directly(false);
-            RCLCPP_WARN(get_logger(), "Failed to fetch \"/dart/micro_switch\". Set to false.");
-        }
+        bind_or(command_input_, ActionCmd{}, "/dart/carriage_action/command");
+        bind_or(angle_, 0.0, "/dart/carriage_motor/angle");
+        bind_or(velocity_, 0.0, "/dart/carriage_motor/velocity");
+        bind_or(micro_switch_, false, "/dart/micro_switch");
     }
 
     void update() override {
         const ActionCmd cmd = *command_input_;
-        if (cmd.seq != active_seq_)
-            start_command(cmd);
+        const bool is_new = (cmd.seq != active_seq_);
+        if (is_new) {
+            active_seq_ = cmd.seq;
+            active_type_ = cmd.type;
+            active_ticks_ = 0;
+        } else if (status_ == MechStatus::BUSY) {
+            ++active_ticks_;
+        }
 
-        if (status_ == MechStatus::BUSY)
-            step_command();
+        if (is_new || status_ == MechStatus::BUSY)
+            status_ = dispatch_action(cmd, is_new);
 
         *feedback_output_ = Feedback{active_seq_, status_};
     }
 
 private:
-    void start_command(const ActionCmd& cmd) {
-        active_seq_ = cmd.seq;
-        active_type_ = cmd.type;
-        ticks_ = 0;
+    enum class HomePhase { kSeekSwitch, kBackOff };
 
-        switch (cmd.type) {
+    template <typename T, typename V>
+    void bind_or(InputInterface<T>& iface, V&& fallback, const char* name) {
+        if (iface.ready())
+            return;
+        iface.make_and_bind_directly(T(std::forward<V>(fallback)));
+        RCLCPP_WARN(get_logger(), "Failed to fetch \"%s\". Set to default.", name);
+    }
+
+    MechStatus dispatch_action(const ActionCmd& cmd, bool is_new) {
+        switch (active_type_) {
         case ActionType::IDLE:
-            status_ = MechStatus::IDLE;
-            break;
+            return MechStatus::IDLE;
 
         case ActionType::HOLD:
-            hold();
-            status_ = MechStatus::SUCCEEDED;
-            break;
+            drive_hold();
+            return MechStatus::SUCCEEDED;
 
         case ActionType::HOME:
-            home_phase_ = 0;
-            hit_angle_ = 0.0;
-            *cmd_velocity_ = home_velocity_;
-            *calibrate_ = false;
-            status_ = MechStatus::BUSY;
-            break;
+            return run_home(is_new);
 
         case ActionType::GOTO:
-            if (!std::isfinite(cmd.target_angle)) {
-                hold();
-                status_ = MechStatus::FAILED;
-                RCLCPP_ERROR(get_logger(), "[CarriageAction] invalid GOTO target_angle");
-                return;
-            }
-            target_angle_ = cmd.target_angle;
-            *calibrate_ = false;
-            status_ = MechStatus::BUSY;
-            break;
+            return run_goto(cmd, is_new);
 
         case ActionType::CALIBRATE:
-            *cmd_velocity_ = 0.0;
-            *calibrate_ = true;
-            status_ = MechStatus::BUSY;
-            break;
+            return run_calibrate(is_new);
         }
+        return MechStatus::IDLE;
     }
 
-    void step_command() {
-        ++ticks_;
-
-        switch (active_type_) {
-        case ActionType::HOME:
-            step_home();
-            break;
-
-        case ActionType::GOTO: {
-            const double err = target_angle_ - *angle_;
-            if (std::abs(err) <= std::abs(goto_tolerance_)) {
-                hold();
-                status_ = MechStatus::SUCCEEDED;
-                break;
-            }
-            const double max_v = std::abs(goto_velocity_);
-            *cmd_velocity_ = std::clamp(err * goto_gain_, -max_v, max_v);
-            break;
+    // ── 动作：撞微动开关 → 退离指定角度 ───────────────────────────────────────
+    MechStatus run_home(bool is_new) {
+        if (is_new) {
+            home_phase_ = HomePhase::kSeekSwitch;
+            home_hit_angle_ = 0.0;
         }
 
-        case ActionType::CALIBRATE:
-            if (ticks_ >= kCalibrateHoldTicks) {
-                hold();
-                status_ = MechStatus::SUCCEEDED;
-            }
-            break;
-
-        default:
-            break;
-        }
-    }
-
-    void step_home() {
-        if (home_phase_ == 0) {
-            *cmd_velocity_ = home_velocity_;
+        if (home_phase_ == HomePhase::kSeekSwitch) {
+            drive_velocity(param_home_velocity_);
             if (*micro_switch_) {
-                hit_angle_ = *angle_;
-                home_phase_ = 1;
+                home_hit_angle_ = *angle_;
+                home_phase_ = HomePhase::kBackOff;
                 RCLCPP_INFO(
-                    get_logger(), "[CarriageAction] switch hit at %.3f, backing off", hit_angle_);
-            } else if (ticks_ % 1000 == 0) {
+                    get_logger(), "[CarriageAction] switch hit at %.3f, backing off",
+                    home_hit_angle_);
+            } else if (active_ticks_ % 1000 == 0) {
                 RCLCPP_INFO(
                     get_logger(), "[CarriageAction] seeking: angle=%.3f vel=%.3f", *angle_,
                     *velocity_);
             }
-            return;
+            return MechStatus::BUSY;
         }
 
-        *cmd_velocity_ = back_off_velocity_;
-        const double moved = std::abs(*angle_ - hit_angle_);
-        if (moved >= std::abs(back_off_distance_)) {
-            hold();
-            status_ = MechStatus::SUCCEEDED;
+        drive_velocity(param_back_off_velocity_);
+        const double moved = std::abs(*angle_ - home_hit_angle_);
+        if (moved >= std::abs(param_back_off_distance_)) {
+            drive_hold();
             RCLCPP_INFO(get_logger(), "[CarriageAction] backed off %.3f, done", moved);
-            return;
+            return MechStatus::SUCCEEDED;
         }
-        if (ticks_ % 1000 == 0) {
+        if (active_ticks_ % 1000 == 0) {
             RCLCPP_INFO(
                 get_logger(), "[CarriageAction] backing off: %.4f / %.4f", moved,
-                std::abs(back_off_distance_));
+                std::abs(param_back_off_distance_));
         }
+        return MechStatus::BUSY;
     }
 
-    void hold() {
-        *cmd_velocity_ = 0.0;
+    // ── 动作：按软件虚拟零点定位到目标角度（P 控制）───────────────────────────
+    MechStatus run_goto(const ActionCmd& cmd, bool is_new) {
+        if (is_new) {
+            if (!std::isfinite(cmd.target_angle)) {
+                drive_hold();
+                RCLCPP_ERROR(get_logger(), "[CarriageAction] invalid GOTO target_angle");
+                return MechStatus::FAILED;
+            }
+            goto_target_rel_ = cmd.target_angle;
+        }
+
+        const double rel_angle = *angle_ - calib_zero_offset_;
+        const double err = goto_target_rel_ - rel_angle;
+        if (std::abs(err) <= std::abs(param_goto_tolerance_)) {
+            drive_hold();
+            return MechStatus::SUCCEEDED;
+        }
+
+        const double max_v = std::abs(param_goto_velocity_);
+        drive_velocity(std::clamp(err * param_goto_gain_, -max_v, max_v));
+        return MechStatus::BUSY;
+    }
+
+    // ── 动作：标零（记录软件虚拟零点，不修改底层硬件编码器）──────────────────
+    MechStatus run_calibrate(bool is_new) {
+        if (is_new)
+            calib_zero_offset_ = *angle_;
+
+        drive_hold();
+        return active_ticks_ >= kCalibrateHoldTicks ? MechStatus::SUCCEEDED : MechStatus::BUSY;
+    }
+
+    // ── 底层输出收口 ────────────────────────────────────────────────────────
+    void drive_velocity(double velocity) {
+        *cmd_velocity_ = velocity;
         *calibrate_ = false;
     }
+
+    void drive_hold() { drive_velocity(0.0); }
 
     static constexpr uint64_t kCalibrateHoldTicks = 5;
 
     // ── 参数 ────────────────────────────────────────────────────────────────
-    double home_velocity_{5.0};
-    double back_off_velocity_{2.0};
-    double back_off_distance_{0.1};
-    double goto_velocity_{20.0};
-    double goto_gain_{10.0};
-    double goto_tolerance_{0.02};
+    double param_home_velocity_{5.0};
+    double param_back_off_velocity_{2.0};
+    double param_back_off_distance_{0.1};
+    double param_goto_velocity_{20.0};
+    double param_goto_gain_{10.0};
+    double param_goto_tolerance_{0.02};
 
-    // ── 状态变量 ────────────────────────────────────────────────────────────
+    // ── 任务调度状态 ────────────────────────────────────────────────────────
     uint32_t active_seq_{0};
     ActionType active_type_{ActionType::IDLE};
+    uint64_t active_ticks_{0};
     MechStatus status_{MechStatus::IDLE};
-    uint64_t ticks_{0};
-    int home_phase_{0};
-    double hit_angle_{0.0};
-    double target_angle_{0.0};
+
+    // ── 归零状态 ────────────────────────────────────────────────────────────
+    HomePhase home_phase_{HomePhase::kSeekSwitch};
+    double home_hit_angle_{0.0};
+
+    // ── 定位状态 ────────────────────────────────────────────────────────────
+    double goto_target_rel_{0.0};
+
+    // ── 软件虚拟零点 ────────────────────────────────────────────────────────
+    double calib_zero_offset_{0.0};
 
     // ── 输入接口 ────────────────────────────────────────────────────────────
     InputInterface<ActionCmd> command_input_;

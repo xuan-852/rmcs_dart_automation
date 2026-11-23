@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <utility>
 
 #include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
@@ -13,12 +14,8 @@ namespace rmcs_dart_guidance::v2 {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // BeltActionComponent
-//   同步带上层动作执行组件（标准 RMCS 写法）。
-//
-//   职责：
-//     接收 DartAgent 发来的通用物理能力指令（RELEASE / HOLD / HOME_TO_STALL /
-//     RETURN_TO_STALL / MOVE_REL / CALIBRATE），按 seq 订单号执行动作并回报反馈。
-//     底层手动控制、左右同步、物理堵转检测仍全部留在 BeltNewController，互不耦合。
+//   同步带上层动作执行组件：接收 DartAgent 下发的 (seq, ActionType) 指令，
+//   驱动底层规划器/控制器完成放手、保持、上推堵转、相对位移与标零。
 // ═════════════════════════════════════════════════════════════════════════════
 class BeltActionComponent
     : public rmcs_executor::Component
@@ -38,13 +35,13 @@ public:
         constexpr double nan = std::numeric_limits<double>::quiet_NaN();
         constexpr double inf = std::numeric_limits<double>::infinity();
 
-        // ── 1. 注册输入 ─────────────────────────────────────────────────────
+        // ── 1. 反馈输入 ─────────────────────────────────────────────────────
         register_input("/dart/belt_action/command", command_input_, false);
         register_input("/dart/belt/left_motor/angle", left_angle_, false);
         register_input("/dart/belt/right_motor/angle", right_angle_, false);
         register_input("/dart/belt/stalled", stalled_, false);
 
-        // ── 2. 注册输出（底层控制输出经 command_component_ 发出，避免拓扑成环）
+        // ── 2. 底层控制输出（经 command_component_ 发出，避免拓扑成环）──────
         command_component_->register_output("/dart/belt/left_motor/target_angle", left_target_angle_, nan);
         command_component_->register_output("/dart/belt/right_motor/target_angle", right_target_angle_, nan);
         command_component_->register_output("/dart/belt/left_motor/direct_velocity", left_direct_velocity_, nan);
@@ -59,13 +56,13 @@ public:
         register_output("/dart/belt_action/feedback", feedback_output_, Feedback{});
 
         // ── 3. 读取参数 ─────────────────────────────────────────────────────
-        get_parameter_or("belt_home_velocity", belt_home_velocity_, 5.0);
-        get_parameter_or("belt_down_velocity", belt_down_velocity_, 5.0);
-        get_parameter_or("belt_up_velocity", belt_up_velocity_, 8.0);
-        get_parameter_or("homing_torque_limit", homing_torque_limit_, 3.0);
-        get_parameter_or("belt_load_torque_limit", belt_load_torque_limit_, 6.0);
-        get_parameter_or("belt_unload_torque_limit", belt_unload_torque_limit_, 2.0);
-        get_parameter_or("arrive_tolerance", arrive_tolerance_, 0.03);
+        get_parameter_or("belt_home_velocity", param_home_velocity_, 5.0);
+        get_parameter_or("belt_down_velocity", param_down_velocity_, 5.0);
+        get_parameter_or("belt_up_velocity", param_up_velocity_, 8.0);
+        get_parameter_or("homing_torque_limit", param_homing_torque_limit_, 3.0);
+        get_parameter_or("belt_load_torque_limit", param_load_torque_limit_, 6.0);
+        get_parameter_or("belt_unload_torque_limit", param_unload_torque_limit_, 2.0);
+        get_parameter_or("arrive_tolerance", param_arrive_tolerance_, 0.03);
     }
 
     BeltActionComponent(const BeltActionComponent&) = delete;
@@ -76,32 +73,25 @@ public:
     ~BeltActionComponent() override = default;
 
     void before_updating() override {
-        if (!command_input_.ready()) {
-            command_input_.make_and_bind_directly(ActionCmd{});
-            RCLCPP_WARN(
-                get_logger(), "Failed to fetch \"/dart/belt_action/command\". Set to IDLE.");
-        }
-        if (!left_angle_.ready()) {
-            left_angle_.make_and_bind_directly(0.0);
-            RCLCPP_WARN(get_logger(), "Failed to fetch \"/dart/belt/left_motor/angle\". Set to 0.");
-        }
-        if (!right_angle_.ready()) {
-            right_angle_.make_and_bind_directly(0.0);
-            RCLCPP_WARN(get_logger(), "Failed to fetch \"/dart/belt/right_motor/angle\". Set to 0.");
-        }
-        if (!stalled_.ready()) {
-            stalled_.make_and_bind_directly(false);
-            RCLCPP_WARN(get_logger(), "Failed to fetch \"/dart/belt/stalled\". Set to false.");
-        }
+        bind_or(command_input_, ActionCmd{}, "/dart/belt_action/command");
+        bind_or(left_angle_, 0.0, "/dart/belt/left_motor/angle");
+        bind_or(right_angle_, 0.0, "/dart/belt/right_motor/angle");
+        bind_or(stalled_, false, "/dart/belt/stalled");
     }
 
     void update() override {
         const ActionCmd cmd = *command_input_;
-        if (cmd.seq != active_seq_)
-            start_command(cmd);
+        const bool is_new = (cmd.seq != active_seq_);
+        if (is_new) {
+            active_seq_ = cmd.seq;
+            active_type_ = cmd.type;
+            active_ticks_ = 0;
+        } else if (status_ == MechStatus::BUSY) {
+            ++active_ticks_;
+        }
 
-        if (status_ == MechStatus::BUSY)
-            step_command();
+        if (is_new || status_ == MechStatus::BUSY)
+            status_ = dispatch_action(cmd, is_new);
 
         *feedback_output_ = Feedback{active_seq_, status_};
     }
@@ -112,188 +102,186 @@ private:
         void update() override {}
     };
 
-    static double pick(double override_val, double fallback) {
+    template <typename T, typename V>
+    void bind_or(InputInterface<T>& iface, V&& fallback, const char* name) {
+        if (iface.ready())
+            return;
+        iface.make_and_bind_directly(T(std::forward<V>(fallback)));
+        RCLCPP_WARN(get_logger(), "Failed to fetch \"%s\". Set to default.", name);
+    }
+
+    static double pick_positive(double override_val, double fallback) {
         return (std::isfinite(override_val) && override_val > 0.0) ? override_val : fallback;
     }
 
-    void start_command(const ActionCmd& cmd) {
-        active_seq_ = cmd.seq;
-        active_type_ = cmd.type;
-        ticks_ = 0;
+    static double pick_nonzero(double override_val, double fallback) {
+        return (std::isfinite(override_val) && override_val != 0.0) ? override_val : fallback;
+    }
 
-        switch (cmd.type) {
+    MechStatus dispatch_action(const ActionCmd& cmd, bool is_new) {
+        switch (active_type_) {
         case ActionType::IDLE:
-            status_ = MechStatus::IDLE;
-            break;
+            return MechStatus::IDLE;
 
         case ActionType::RELEASE:
-            release_belt();
-            status_ = MechStatus::SUCCEEDED;
-            break;
+            drive_release();
+            return MechStatus::SUCCEEDED;
 
         case ActionType::HOLD:
-            active_torque_limit_ = pick(cmd.torque_limit, belt_unload_torque_limit_);
-            hold_belt(active_torque_limit_);
-            status_ = MechStatus::SUCCEEDED;
-            break;
+            drive_hold(pick_positive(cmd.torque_limit, param_unload_torque_limit_));
+            return MechStatus::SUCCEEDED;
 
         case ActionType::HOME_TO_STALL:
-            active_velocity_ = cmd.velocity != 0.0 && std::isfinite(cmd.velocity)
-                                 ? cmd.velocity
-                                 : belt_home_velocity_;
-            active_torque_limit_ = pick(cmd.torque_limit, homing_torque_limit_);
-            write_direct(active_velocity_, active_torque_limit_);
-            status_ = MechStatus::BUSY;
-            break;
+            return run_push_to_stall(
+                cmd, is_new, param_home_velocity_, param_homing_torque_limit_);
 
         case ActionType::RETURN_TO_STALL:
-            active_velocity_ = cmd.velocity != 0.0 && std::isfinite(cmd.velocity)
-                                 ? cmd.velocity
-                                 : belt_up_velocity_;
-            active_torque_limit_ = pick(cmd.torque_limit, belt_unload_torque_limit_);
-            write_direct(active_velocity_, active_torque_limit_);
-            status_ = MechStatus::BUSY;
-            break;
+            return run_push_to_stall(
+                cmd, is_new, param_up_velocity_, param_unload_torque_limit_);
 
         case ActionType::MOVE_REL:
+            return run_move_rel(cmd, is_new);
+
+        case ActionType::CALIBRATE:
+            return run_calibrate(cmd, is_new);
+        }
+        return MechStatus::IDLE;
+    }
+
+    // ── 动作：上推至顶部机械限位堵转（HOME_TO_STALL / RETURN_TO_STALL）────────
+    MechStatus run_push_to_stall(
+        const ActionCmd& cmd, bool is_new, double default_vel, double default_torque_limit) {
+        if (is_new) {
+            stall_velocity_ = pick_nonzero(cmd.velocity, default_vel);
+            stall_torque_limit_ = pick_positive(cmd.torque_limit, default_torque_limit);
+        }
+
+        drive_velocity(stall_velocity_, stall_torque_limit_);
+        // 跳过起步前 kStallGraceTicks 毫秒的加速瞬间，确认堵转后原地顶住
+        if (active_ticks_ >= kStallGraceTicks && *stalled_) {
+            drive_hold(stall_torque_limit_);
+            return MechStatus::SUCCEEDED;
+        }
+        return MechStatus::BUSY;
+    }
+
+    // ── 动作：相对当前位置移动指定弧度（走 SCurvePlanner）─────────────────────
+    MechStatus run_move_rel(const ActionCmd& cmd, bool is_new) {
+        if (is_new) {
             if (!std::isfinite(cmd.distance) || std::abs(cmd.distance) <= 1e-6) {
-                hold_belt(belt_load_torque_limit_);
-                status_ = MechStatus::FAILED;
+                drive_hold(param_load_torque_limit_);
                 RCLCPP_ERROR(get_logger(), "[BeltAction] invalid MOVE_REL distance=%.4f", cmd.distance);
-                return;
+                return MechStatus::FAILED;
             }
-            signed_distance_ = cmd.distance;
-            active_velocity_ = pick(
-                cmd.velocity, signed_distance_ >= 0.0 ? belt_up_velocity_ : belt_down_velocity_);
-            active_torque_limit_ = pick(cmd.torque_limit, belt_load_torque_limit_);
-            start_left_ = *left_angle_;
-            start_right_ = *right_angle_;
-            target_left_ = start_left_ + signed_distance_;
-            target_right_ = start_right_ + signed_distance_;
-            write_move_to(target_left_, target_right_, active_velocity_, active_torque_limit_);
-            status_ = MechStatus::BUSY;
-            break;
-
-        case ActionType::CALIBRATE:
-            active_torque_limit_ = pick(cmd.torque_limit, homing_torque_limit_);
-            hold_belt(active_torque_limit_);
-            *left_calibrate_ = true;
-            *right_calibrate_ = true;
-            status_ = MechStatus::BUSY;
-            break;
+            move_signed_distance_ = cmd.distance;
+            move_velocity_limit_ = pick_positive(
+                cmd.velocity,
+                move_signed_distance_ >= 0.0 ? param_up_velocity_ : param_down_velocity_);
+            move_torque_limit_ = pick_positive(cmd.torque_limit, param_load_torque_limit_);
+            move_start_left_ = *left_angle_;
+            move_start_right_ = *right_angle_;
+            move_target_left_ = move_start_left_ + move_signed_distance_;
+            move_target_right_ = move_start_right_ + move_signed_distance_;
         }
+
+        drive_position(
+            move_target_left_, move_target_right_, move_velocity_limit_, move_torque_limit_);
+
+        const double dir = move_signed_distance_ >= 0.0 ? 1.0 : -1.0;
+        const double moved_l = (*left_angle_ - move_start_left_) * dir;
+        const double moved_r = (*right_angle_ - move_start_right_) * dir;
+        if (std::max(moved_l, moved_r) >= std::abs(move_signed_distance_) - param_arrive_tolerance_) {
+            drive_hold(move_torque_limit_);
+            return MechStatus::SUCCEEDED;
+        }
+        return MechStatus::BUSY;
     }
 
-    void step_command() {
-        ++ticks_;
-
-        switch (active_type_) {
-        case ActionType::HOME_TO_STALL:
-        case ActionType::RETURN_TO_STALL:
-            write_direct(active_velocity_, active_torque_limit_);
-            if (ticks_ >= kStallGraceTicks && *stalled_) {
-                hold_belt(active_torque_limit_);
-                status_ = MechStatus::SUCCEEDED;
-            }
-            break;
-
-        case ActionType::MOVE_REL: {
-            write_move_to(target_left_, target_right_, active_velocity_, active_torque_limit_);
-            const double dir = signed_distance_ >= 0.0 ? 1.0 : -1.0;
-            const double moved_l = (*left_angle_ - start_left_) * dir;
-            const double moved_r = (*right_angle_ - start_right_) * dir;
-            if (std::max(moved_l, moved_r) >= std::abs(signed_distance_) - arrive_tolerance_) {
-                hold_belt(active_torque_limit_);
-                status_ = MechStatus::SUCCEEDED;
-            }
-            break;
+    // ── 动作：标零（记录软件虚拟零点 + 通知下层同步控制器对齐零点）─────────
+    MechStatus run_calibrate(const ActionCmd& cmd, bool is_new) {
+        if (is_new) {
+            calib_torque_limit_ = pick_positive(cmd.torque_limit, param_homing_torque_limit_);
+            calib_left_zero_offset_ = *left_angle_;
+            calib_right_zero_offset_ = *right_angle_;
         }
 
-        case ActionType::CALIBRATE:
-            if (ticks_ >= kCalibrateHoldTicks) {
-                hold_belt(active_torque_limit_);
-                status_ = MechStatus::SUCCEEDED;
-            }
-            break;
-
-        default:
-            break;
-        }
+        const bool finished = active_ticks_ >= kCalibrateHoldTicks;
+        drive_velocity(0.0, calib_torque_limit_, /*calibrate=*/!finished);
+        return finished ? MechStatus::SUCCEEDED : MechStatus::BUSY;
     }
 
-    void write_move_to(
-        double target_l, double target_r, double velocity_limit, double torque_limit) {
-        constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+    // ── 底层输出收口 ────────────────────────────────────────────────────────
+    void apply_outputs(
+        double target_l, double target_r, double direct_vel, double vel_limit, double torque_limit,
+        bool calibrate) {
         *left_target_angle_ = target_l;
         *right_target_angle_ = target_r;
-        *left_direct_velocity_ = nan;
-        *right_direct_velocity_ = nan;
-        *left_velocity_limit_ = std::abs(velocity_limit);
-        *right_velocity_limit_ = std::abs(velocity_limit);
+        *left_direct_velocity_ = direct_vel;
+        *right_direct_velocity_ = direct_vel;
+        *left_velocity_limit_ = vel_limit;
+        *right_velocity_limit_ = vel_limit;
         *left_torque_limit_ = torque_limit;
         *right_torque_limit_ = torque_limit;
-        *left_calibrate_ = false;
-        *right_calibrate_ = false;
+        *left_calibrate_ = calibrate;
+        *right_calibrate_ = calibrate;
     }
 
-    void write_direct(double velocity, double torque_limit) {
+    void drive_release() {
         constexpr double nan = std::numeric_limits<double>::quiet_NaN();
         constexpr double inf = std::numeric_limits<double>::infinity();
-        *left_target_angle_ = nan;
-        *right_target_angle_ = nan;
-        *left_direct_velocity_ = velocity;
-        *right_direct_velocity_ = velocity;
-        *left_velocity_limit_ = inf;
-        *right_velocity_limit_ = inf;
-        *left_torque_limit_ = torque_limit;
-        *right_torque_limit_ = torque_limit;
-        *left_calibrate_ = false;
-        *right_calibrate_ = false;
+        apply_outputs(nan, nan, nan, inf, nan, false);
     }
 
-    void hold_belt(double torque_limit) { write_direct(0.0, torque_limit); }
-
-    void release_belt() {
+    void drive_velocity(double velocity, double torque_limit, bool calibrate = false) {
         constexpr double nan = std::numeric_limits<double>::quiet_NaN();
         constexpr double inf = std::numeric_limits<double>::infinity();
-        *left_target_angle_ = nan;
-        *right_target_angle_ = nan;
-        *left_direct_velocity_ = nan;
-        *right_direct_velocity_ = nan;
-        *left_velocity_limit_ = inf;
-        *right_velocity_limit_ = inf;
-        *left_torque_limit_ = nan;
-        *right_torque_limit_ = nan;
-        *left_calibrate_ = false;
-        *right_calibrate_ = false;
+        apply_outputs(nan, nan, velocity, inf, torque_limit, calibrate);
+    }
+
+    void drive_hold(double torque_limit) { drive_velocity(0.0, torque_limit); }
+
+    void drive_position(
+        double target_l, double target_r, double velocity_limit, double torque_limit) {
+        constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+        apply_outputs(target_l, target_r, nan, std::abs(velocity_limit), torque_limit, false);
     }
 
     static constexpr uint64_t kStallGraceTicks = 50;
     static constexpr uint64_t kCalibrateHoldTicks = 5;
 
     // ── 参数 ────────────────────────────────────────────────────────────────
-    double belt_home_velocity_{5.0};
-    double belt_down_velocity_{5.0};
-    double belt_up_velocity_{8.0};
-    double homing_torque_limit_{3.0};
-    double belt_load_torque_limit_{6.0};
-    double belt_unload_torque_limit_{2.0};
-    double arrive_tolerance_{0.03};
+    double param_home_velocity_{5.0};
+    double param_down_velocity_{5.0};
+    double param_up_velocity_{8.0};
+    double param_homing_torque_limit_{3.0};
+    double param_load_torque_limit_{6.0};
+    double param_unload_torque_limit_{2.0};
+    double param_arrive_tolerance_{0.03};
 
-    // ── 状态变量 ────────────────────────────────────────────────────────────
+    // ── 任务调度状态 ────────────────────────────────────────────────────────
     std::shared_ptr<CommandComponent> command_component_;
     uint32_t active_seq_{0};
     ActionType active_type_{ActionType::IDLE};
+    uint64_t active_ticks_{0};
     MechStatus status_{MechStatus::IDLE};
-    uint64_t ticks_{0};
 
-    double signed_distance_{0.0};
-    double active_velocity_{0.0};
-    double active_torque_limit_{0.0};
-    double start_left_{0.0};
-    double start_right_{0.0};
-    double target_left_{0.0};
-    double target_right_{0.0};
+    // ── 堵转推进状态 ────────────────────────────────────────────────────────
+    double stall_velocity_{0.0};
+    double stall_torque_limit_{0.0};
+
+    // ── 相对位移状态 ────────────────────────────────────────────────────────
+    double move_signed_distance_{0.0};
+    double move_velocity_limit_{0.0};
+    double move_torque_limit_{0.0};
+    double move_start_left_{0.0};
+    double move_start_right_{0.0};
+    double move_target_left_{0.0};
+    double move_target_right_{0.0};
+
+    // ── 软件虚拟零点 ────────────────────────────────────────────────────────
+    double calib_torque_limit_{0.0};
+    double calib_left_zero_offset_{0.0};
+    double calib_right_zero_offset_{0.0};
 
     // ── 输入接口 ────────────────────────────────────────────────────────────
     InputInterface<ActionCmd> command_input_;

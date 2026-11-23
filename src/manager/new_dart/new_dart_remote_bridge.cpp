@@ -13,9 +13,9 @@ namespace rmcs_dart_guidance::v2 {
 //   新镖架遥控器桥：将 DR16 拨杆边沿按规则表翻为 /dart/manager/command。
 //
 //   键位：
-//     左 UP    + 右 MID           手动（本桥静默，DartAgent 同时中止运行中任务）
-//     左右双下                    静默（硬件层全电机 NaN 急停 + DartAgent 锁 FAILED）
-//     左 DOWN → MID               recover（解锁 FAILED + 清发射计数 + 自动归零）
+//     左 UP    + 右 MID           手动（发出 "stop" 中止运行中任务回 IDLE）
+//     左右双下                    急停（发出 "cancel"，硬件层 NaN 急停 + DartAgent 锁 ERROR）
+//     左 DOWN → MID               recover（解锁 ERROR + 清发射计数 + 自动归零）
 //     左 MID  + 右 MID → DOWN     发射准备 ⇄ 取消准备（toggle）
 //     左 MID  + 右 MID → UP       发射
 // ═════════════════════════════════════════════════════════════════════════════
@@ -51,11 +51,11 @@ public:
         }
 
         RCLCPP_INFO(get_logger(), "[DartAgentRemoteBridge] 键位：");
-        RCLCPP_INFO(get_logger(), "  manual  : left=UP         right=MID");
-        RCLCPP_INFO(get_logger(), "  recover : left=DOWN->MID  (解锁 FAILED 并触发 dart-init)");
+        RCLCPP_INFO(get_logger(), "  manual  : left=UP         right=MID (发 stop 中止任务回 IDLE)");
+        RCLCPP_INFO(get_logger(), "  recover : left=DOWN->MID  (解锁 ERROR 并触发 dart-init)");
         RCLCPP_INFO(get_logger(), "  prepare : left=MID        right=MID->DOWN (toggle cancel)");
         RCLCPP_INFO(get_logger(), "  fire    : left=MID        right=MID->UP");
-        RCLCPP_INFO(get_logger(), "  双下     : 静默 (硬件层 NaN 急停 + DartAgent 锁 FAILED)");
+        RCLCPP_INFO(get_logger(), "  双下     : left=DOWN       right=DOWN (发 cancel 锁 ERROR + 硬件 NaN 急停)");
     }
 
     void update() override {
@@ -66,12 +66,16 @@ public:
         const auto left = *switch_left_;
         const auto right = *switch_right_;
 
-        // 接收机断联、上电首帧、手动档或双下急停：不触发任务边沿，统一走末尾记录
-        const bool suppressed = left == Switch::UNKNOWN || right == Switch::UNKNOWN
-                             || prev_left_ == Switch::UNKNOWN || prev_right_ == Switch::UNKNOWN
-                             || (left == Switch::UP && right == Switch::MIDDLE)
-                             || (left == Switch::DOWN && right == Switch::DOWN);
-        if (suppressed) {
+        if (left == Switch::DOWN && right == Switch::DOWN) {
+            *command_output_ = "cancel";
+            prepare_armed_ = false;
+        } else if (left == Switch::UP && right == Switch::MIDDLE) {
+            *command_output_ = "stop";
+            prepare_armed_ = false;
+        } else if (
+            left == Switch::UNKNOWN || right == Switch::UNKNOWN || prev_left_ == Switch::UNKNOWN
+            || prev_right_ == Switch::UNKNOWN) {
+            // 接收机断联或上电首帧：只更新历史状态，不触发边沿任务
             prepare_armed_ = false;
         } else {
             for (const auto& rule : kRules) {
@@ -108,7 +112,7 @@ private:
     static constexpr SwitchRule kRules[] = {
         {rmcs_msgs::Switch::DOWN,   rmcs_msgs::Switch::MIDDLE, std::nullopt,               std::nullopt,               false, "recover",             nullptr},
         {rmcs_msgs::Switch::MIDDLE, rmcs_msgs::Switch::MIDDLE, rmcs_msgs::Switch::MIDDLE,  rmcs_msgs::Switch::DOWN,    true,  "dart-launch-prepare", "dart-launch-cancel"},
-        {rmcs_msgs::Switch::MIDDLE, rmcs_msgs::Switch::MIDDLE, rmcs_msgs::Switch::MIDDLE,  rmcs_msgs::Switch::UP,      false, "dart-fire",           nullptr},
+        {rmcs_msgs::Switch::MIDDLE, rmcs_msgs::Switch::MIDDLE, rmcs_msgs::Switch::DOWN,  rmcs_msgs::Switch::MIDDLE,      false, "dart-fire",           nullptr},
     };
 
     rmcs_msgs::Switch prev_left_{rmcs_msgs::Switch::UNKNOWN};
