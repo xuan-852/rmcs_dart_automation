@@ -187,22 +187,24 @@ inline std::shared_ptr<manager::Task> make_task(
     using BeltType = rmcs_dart_guidance::msg::BeltActionType;
     using CarriageType = rmcs_dart_guidance::msg::CarriageActionType;
     using BeltAction = SeqCommandAction<BeltActionResource, BeltType>;
-    using CarriageAction = SeqCommandAction<CarriageActionResource, CarriageType>;
+    using CarriageAction [[maybe_unused]] = SeqCommandAction<CarriageActionResource, CarriageType>;
 
     constexpr uint64_t kHomeTimeoutTicks = 500000;
     constexpr uint64_t kMechanismTimeoutTicks = 300000;
     constexpr uint64_t kCalibrateTimeoutTicks = 1000;
 
+    (void)carriage;
     if (cmd == "dart-init") {
         auto task = std::make_shared<manager::Task>("dart-init", "初始化");
         task->then(std::make_shared<BeltAction>(
             "belt_home", belt, BeltType::HOME_TO_STALL, kHomeTimeoutTicks));
         task->then(std::make_shared<BeltAction>(
             "belt_calibrate", belt, BeltType::CALIBRATE, kCalibrateTimeoutTicks));
-        task->then(std::make_shared<CarriageAction>(
-            "carriage_home", carriage, CarriageType::HOME, kHomeTimeoutTicks));
-        task->then(std::make_shared<CarriageAction>(
-            "carriage_calibrate", carriage, CarriageType::CALIBRATE, kCalibrateTimeoutTicks));
+        // 弹舱机械暂未接线，测试同步带期间跳过 carriage_home / carriage_calibrate
+        // task->then(std::make_shared<CarriageAction>(
+        //     "carriage_home", carriage, CarriageType::HOME, kHomeTimeoutTicks));
+        // task->then(std::make_shared<CarriageAction>(
+        //     "carriage_calibrate", carriage, CarriageType::CALIBRATE, kCalibrateTimeoutTicks));
         return task;
     }
 
@@ -210,16 +212,17 @@ inline std::shared_ptr<manager::Task> make_task(
         auto task = std::make_shared<manager::Task>("dart-launch-prepare", "发射准备");
         const int idx = static_cast<int>(runtime_state.fire_count);
         const bool slot_ok = settings.configured() && idx >= 0 && idx < settings.dart_count;
-        const double target_angle =
-            slot_ok ? settings.staypoints[static_cast<std::size_t>(idx)] : 0.0;
+        // 弹舱机械暂未接线，测试同步带期间跳过 carriage_goto_current
+        // const double target_angle =
+        //     slot_ok ? settings.staypoints[static_cast<std::size_t>(idx)] : 0.0;
 
         task->then(std::make_shared<manager::ConfigurationGuardAction>(
             "settings_and_slot_configured", slot_ok));
-        task->then(std::make_shared<CarriageAction>(
-            "carriage_goto_current", carriage, CarriageType::GOTO, kMechanismTimeoutTicks,
-            target_angle));
+        // task->then(std::make_shared<CarriageAction>(
+        //     "carriage_goto_current", carriage, CarriageType::GOTO, kMechanismTimeoutTicks,
+        //     target_angle));
         task->then(std::make_shared<BeltAction>(
-            "belt_down_to_trigger", belt, BeltType::MOVE_REL, kMechanismTimeoutTicks,
+            "belt_down_to_trigger", belt, BeltType::PULL_TO_TRIGGER, kMechanismTimeoutTicks,
             -std::abs(settings.belt_trigger_distance)));
         task->then(std::make_shared<manager::DelayAction>("settle_delay", 200));
         // TODO: trigger_lock —— 扳机舵机接入后替换

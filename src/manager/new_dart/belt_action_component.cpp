@@ -57,7 +57,9 @@ public:
 
         // ── 3. 读取参数 ─────────────────────────────────────────────────────
         get_parameter_or("belt_home_velocity", param_home_velocity_, 5.0);
-        get_parameter_or("belt_down_velocity", param_down_velocity_, 5.0);
+        get_parameter_or("belt_approach_distance", param_approach_distance_, 13.0);
+        get_parameter_or("belt_approach_velocity", param_approach_velocity_, 3.0);
+        get_parameter_or("belt_down_velocity", param_down_velocity_, 10.0);
         get_parameter_or("belt_up_velocity", param_up_velocity_, 8.0);
         get_parameter_or("homing_torque_limit", param_homing_torque_limit_, 3.0);
         get_parameter_or("belt_load_torque_limit", param_load_torque_limit_, 6.0);
@@ -142,6 +144,9 @@ private:
         case ActionType::MOVE_REL:
             return run_move_rel(cmd, is_new);
 
+        case ActionType::PULL_TO_TRIGGER:
+            return run_pull_to_trigger(cmd, is_new);
+
         case ActionType::CALIBRATE:
             return run_calibrate(cmd, is_new);
         }
@@ -165,31 +170,64 @@ private:
         return MechStatus::BUSY;
     }
 
-    // ── 动作：相对当前位置移动指定弧度（走 SCurvePlanner）─────────────────────
+    bool init_move(const ActionCmd& cmd, double default_vel) {
+        if (!std::isfinite(cmd.distance) || std::abs(cmd.distance) <= 1e-6) {
+            drive_hold(param_load_torque_limit_);
+            RCLCPP_ERROR(get_logger(), "[BeltAction] invalid move distance=%.4f", cmd.distance);
+            return false;
+        }
+        move_signed_distance_ = cmd.distance;
+        move_velocity_limit_ = pick_positive(cmd.velocity, default_vel);
+        move_torque_limit_ = pick_positive(cmd.torque_limit, param_load_torque_limit_);
+        move_start_left_ = *left_angle_;
+        move_start_right_ = *right_angle_;
+        move_target_left_ = move_start_left_ + move_signed_distance_;
+        move_target_right_ = move_start_right_ + move_signed_distance_;
+        return true;
+    }
+
+    std::pair<double, double> moved_distances() const {
+        const double dir = move_signed_distance_ >= 0.0 ? 1.0 : -1.0;
+        return {(*left_angle_ - move_start_left_) * dir, (*right_angle_ - move_start_right_) * dir};
+    }
+
+    // ── 动作：相对当前位置移动指定弧度（走 TrapezoidPlanner）──────────────────
     MechStatus run_move_rel(const ActionCmd& cmd, bool is_new) {
         if (is_new) {
-            if (!std::isfinite(cmd.distance) || std::abs(cmd.distance) <= 1e-6) {
-                drive_hold(param_load_torque_limit_);
-                RCLCPP_ERROR(get_logger(), "[BeltAction] invalid MOVE_REL distance=%.4f", cmd.distance);
+            const double default_vel =
+                cmd.distance >= 0.0 ? param_up_velocity_ : param_down_velocity_;
+            if (!init_move(cmd, default_vel))
                 return MechStatus::FAILED;
-            }
-            move_signed_distance_ = cmd.distance;
-            move_velocity_limit_ = pick_positive(
-                cmd.velocity,
-                move_signed_distance_ >= 0.0 ? param_up_velocity_ : param_down_velocity_);
-            move_torque_limit_ = pick_positive(cmd.torque_limit, param_load_torque_limit_);
-            move_start_left_ = *left_angle_;
-            move_start_right_ = *right_angle_;
-            move_target_left_ = move_start_left_ + move_signed_distance_;
-            move_target_right_ = move_start_right_ + move_signed_distance_;
         }
 
         drive_position(
             move_target_left_, move_target_right_, move_velocity_limit_, move_torque_limit_);
 
-        const double dir = move_signed_distance_ >= 0.0 ? 1.0 : -1.0;
-        const double moved_l = (*left_angle_ - move_start_left_) * dir;
-        const double moved_r = (*right_angle_ - move_start_right_) * dir;
+        const auto [moved_l, moved_r] = moved_distances();
+        if (std::max(moved_l, moved_r) >= std::abs(move_signed_distance_) - param_arrive_tolerance_) {
+            drive_hold(move_torque_limit_);
+            return MechStatus::SUCCEEDED;
+        }
+        return MechStatus::BUSY;
+    }
+
+    // ── 动作：分段下拉（低速接近碰撞点 → 不断速加速拉弹簧 → 到底前减速）─────
+    MechStatus run_pull_to_trigger(const ActionCmd& cmd, bool is_new) {
+        if (is_new) {
+            if (!init_move(cmd, param_down_velocity_))
+                return MechStatus::FAILED;
+            pull_approach_distance_ =
+                pick_positive(cmd.approach_distance, param_approach_distance_);
+            pull_approach_velocity_ =
+                pick_positive(cmd.approach_velocity, param_approach_velocity_);
+        }
+
+        const auto [moved_l, moved_r] = moved_distances();
+        const bool past_collision = std::min(moved_l, moved_r) >= pull_approach_distance_;
+        const double active_vel = past_collision ? move_velocity_limit_ : pull_approach_velocity_;
+
+        drive_position(move_target_left_, move_target_right_, active_vel, move_torque_limit_);
+
         if (std::max(moved_l, moved_r) >= std::abs(move_signed_distance_) - param_arrive_tolerance_) {
             drive_hold(move_torque_limit_);
             return MechStatus::SUCCEEDED;
@@ -251,7 +289,9 @@ private:
 
     // ── 参数 ────────────────────────────────────────────────────────────────
     double param_home_velocity_{5.0};
-    double param_down_velocity_{5.0};
+    double param_approach_distance_{13.0};
+    double param_approach_velocity_{3.0};
+    double param_down_velocity_{10.0};
     double param_up_velocity_{8.0};
     double param_homing_torque_limit_{3.0};
     double param_load_torque_limit_{6.0};
@@ -269,7 +309,7 @@ private:
     double stall_velocity_{0.0};
     double stall_torque_limit_{0.0};
 
-    // ── 相对位移状态 ────────────────────────────────────────────────────────
+    // ── 相对位移 / 分段下拉状态 ─────────────────────────────────────────────
     double move_signed_distance_{0.0};
     double move_velocity_limit_{0.0};
     double move_torque_limit_{0.0};
@@ -277,6 +317,8 @@ private:
     double move_start_right_{0.0};
     double move_target_left_{0.0};
     double move_target_right_{0.0};
+    double pull_approach_distance_{13.0};
+    double pull_approach_velocity_{3.0};
 
     // ── 软件虚拟零点 ────────────────────────────────────────────────────────
     double calib_torque_limit_{0.0};
